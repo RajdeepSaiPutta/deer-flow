@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 #
 # Chinese headings (第三节...) are already captured as standard # headings
 # by pymupdf4llm, so they don't need this pattern.
-_BOLD_HEADING_RE = re.compile(r"^\*\*((ITEM|PART|SECTION|SCHEDULE|EXHIBIT|APPENDIX|ANNEX|CHAPTER)\b[A-Z0-9 .,\-]*)\*\*\s*$")
+_BOLD_HEADING_RE = re.compile(r"^\*\*((ITEM|PART|SECTION|SCHEDULE|EXHIBIT|APPENDIX|ANNEX|CHAPTER)\b[A-Z0-9 .,\-]*)\*\*\s*$", re.MULTILINE)
 
 # Regex for split-bold headings produced by pymupdf4llm when a heading spans
 # multiple text spans in the PDF (e.g. section number and title are separate spans).
@@ -32,7 +32,7 @@ _BOLD_HEADING_RE = re.compile(r"^\*\*((ITEM|PART|SECTION|SCHEDULE|EXHIBIT|APPEND
 #      **1** **概述** or accented words (negative lookahead instead of [A-Za-z])
 #   4. One to three title blocks (four total) with [^*]+ (no * inside) to keep
 #      the regex linear and avoid ReDoS on attacker-controlled content
-_SPLIT_BOLD_HEADING_RE = re.compile(r"^\*\*[\dA-Z][\d\.]*\*\*(?:\s+\*\*(?![\d\s.,+\-–—/:()%$€£¥]+\*\*)[^*]+\*\*){1,3}\s*$")
+_SPLIT_BOLD_HEADING_RE = re.compile(r"^\*\*[\dA-Z][\d\.]*\*\*(?:\s+\*\*(?![\d\s.,+\-–—/:()%$€£¥]+\*\*)[^*]+\*\*){1,3}\s*$", re.MULTILINE)
 
 # Maximum number of outline entries injected into the agent context.
 # Keeps prompt size bounded even for very long documents.
@@ -52,7 +52,7 @@ _HTML_COMMENT_START_RE = re.compile(r"^ {0,3}<!--")
 
 # ATX headings require 1-6 hashes and a space/tab separator (or end of line).
 # Match the original indentation so indented code cannot become a heading.
-_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*))?$")
+_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*))?$", re.MULTILINE)
 
 # Root-level indented code starts at four columns, including
 # a tab after up to three spaces. Do not strip it into a heading.
@@ -100,6 +100,44 @@ def _truncate_outline_text(text: str, max_chars: int) -> str:
     return text[: max_chars - len(_TRUNCATION_MARKER)].rstrip() + _TRUNCATION_MARKER
 
 
+def _normalize_with_mapping(content: str) -> tuple[str, list[int]]:
+    """Normalize line endings to LF and return (normalized, position_map).
+
+    Position map gives the original character index for each normalized index.
+    Handles CRLF -> LF (2->1 char) and bare CR -> LF (1->1 char).
+    """
+    normalized_chars: list[str] = []
+    pos_map: list[int] = []
+    orig_idx = 0
+    i = 0
+    while i < len(content):
+        ch = content[i]
+        if ch == "\r":
+            if i + 1 < len(content) and content[i + 1] == "\n":
+                # CRLF -> LF
+                normalized_chars.append("\n")
+                pos_map.append(orig_idx)
+                orig_idx += 2
+                i += 2
+            else:
+                # bare CR -> LF
+                normalized_chars.append("\n")
+                pos_map.append(orig_idx)
+                orig_idx += 1
+                i += 1
+        else:
+            normalized_chars.append(ch)
+            pos_map.append(orig_idx)
+            orig_idx += 1
+            i += 1
+    return "".join(normalized_chars), pos_map
+
+
+def _physical_line_at(content: str, orig_pos: int) -> int:
+    """Return the 1-based physical line number (by LF count) at orig_pos in content."""
+    return content[:orig_pos].count("\n") + 1
+
+
 def extract_outline(md_path: Path) -> list[dict]:
     """Extract document outline (headings) from a Markdown file.
 
@@ -118,6 +156,9 @@ def extract_outline(md_path: Path) -> list[dict]:
        pymupdf4llm emits these when the section number and title text are
        separate spans in the underlying PDF (common in academic papers).
 
+    Line numbers in the returned outline match the physical line numbering used
+    by LocalSandbox.read_file and count_file_lines (LF-only boundaries).
+
     Args:
         md_path: Path to the .md file.
 
@@ -129,69 +170,94 @@ def extract_outline(md_path: Path) -> list[dict]:
         Returns an empty list if the file cannot be read or has no headings.
     """
     outline: list[dict] = []
-    fence_char = ""
-    fence_length = 0
-    in_html_comment = False
     try:
-        with md_path.open(encoding="utf-8-sig") as f:
-            for lineno, line in enumerate(f, 1):
-                if in_html_comment:
-                    in_html_comment = "-->" not in line
-                    continue
-
-                fence = _CODE_FENCE_RE.match(line.rstrip("\r\n"))
-                if fence_char:
-                    if fence:
-                        marker, suffix = fence.groups()
-                        if marker[0] == fence_char and len(marker) >= fence_length and not suffix.strip(" \t"):
-                            fence_char = ""
-                    continue
-                if _HTML_COMMENT_START_RE.match(line):
-                    in_html_comment = "-->" not in line
-                    continue
-                if fence:
-                    marker, info = fence.groups()
-                    # Backtick info strings cannot contain backticks; tilde
-                    # info strings have no such restriction.
-                    if marker[0] == "~" or "`" not in info:
-                        fence_char = marker[0]
-                        fence_length = len(marker)
-                        continue
-
-                if _INDENTED_CODE_RE.match(line):
-                    continue
-
-                stripped = line.strip()
-                if not stripped:
-                    continue
-
-                # Style 1: standard Markdown heading
-                if m := _ATX_HEADING_RE.fullmatch(line.rstrip("\r\n")):
-                    title = _clean_bold_title(_strip_atx_closing_hashes(m.group(1) or "").strip())
-                    if title:
-                        outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": lineno})
-
-                # Style 2: single bold block with SEC structural keyword
-                elif m := _BOLD_HEADING_RE.match(stripped):
-                    title = m.group(1).strip()
-                    if title:
-                        outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": lineno})
-
-                # Style 3: split-bold heading — **<num>** **<title>**
-                # Regex enforces max 4 blocks and rejects numeric columns after the number.
-                elif _SPLIT_BOLD_HEADING_RE.match(stripped):
-                    title = " ".join(re.findall(r"\*\*([^*]+)\*\*", stripped))
-                    if title:
-                        outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": lineno})
-
-                if len(outline) > MAX_OUTLINE_ENTRIES:
-                    outline.pop()
-                    outline.append({"truncated": True})
-                    break
+        content = md_path.read_text(encoding="utf-8-sig")
     except Exception:
         return []
 
-    return outline
+    # Track state for code fences and HTML comments using physical lines
+    fence_char = ""
+    fence_length = 0
+    in_html_comment = False
+
+    physical_lines = content.split("\n")
+    physical_line_no = 0
+    for physical_line in physical_lines:
+        physical_line_no += 1
+        line = physical_line
+
+        if in_html_comment:
+            in_html_comment = "-->" not in line
+            continue
+
+        fence = _CODE_FENCE_RE.match(line.rstrip("\r"))
+        if fence_char:
+            if fence:
+                marker, suffix = fence.groups()
+                if marker[0] == fence_char and len(marker) >= fence_length and not suffix.strip(" \t"):
+                    fence_char = ""
+            continue
+        if _HTML_COMMENT_START_RE.match(line):
+            in_html_comment = "-->" not in line
+            continue
+        if fence:
+            marker, info = fence.groups()
+            if marker[0] == "~" or "`" not in info:
+                fence_char = marker[0]
+                fence_length = len(marker)
+                continue
+
+        if _INDENTED_CODE_RE.match(line):
+            continue
+
+    # Normalize for heading detection and map positions
+    normalized, pos_map = _normalize_with_mapping(content)
+
+    # Style 1: ATX headings
+    for m in _ATX_HEADING_RE.finditer(normalized):
+        title = _clean_bold_title(_strip_atx_closing_hashes(m.group(1) or "").strip())
+        if title:
+            orig_pos = pos_map[m.start()]
+            line_no = _physical_line_at(content, orig_pos)
+            outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": line_no, "_pos": m.start()})
+
+    # Style 2: bold structural headings
+    for m in _BOLD_HEADING_RE.finditer(normalized):
+        title = m.group(1).strip()
+        if title:
+            orig_pos = pos_map[m.start()]
+            line_no = _physical_line_at(content, orig_pos)
+            outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": line_no, "_pos": m.start()})
+
+    # Style 3: split-bold headings
+    for m in _SPLIT_BOLD_HEADING_RE.finditer(normalized):
+        title = " ".join(re.findall(r"\*\*([^*]+)\*\*", m.group(0)))
+        if title:
+            orig_pos = pos_map[m.start()]
+            line_no = _physical_line_at(content, orig_pos)
+            outline.append({"title": _truncate_outline_text(title, _OUTLINE_TITLE_MAX_CHARS), "line": line_no, "_pos": m.start()})
+
+    # Sort by line number, then by position in file
+    outline.sort(key=lambda e: (e["line"], e.get("_pos", 0)))
+
+    # Remove duplicates (same line, similar title)
+    deduped: list[dict] = []
+    seen = set()
+    for entry in outline:
+        key = (entry["line"], entry["title"][:50])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(entry)
+
+    if len(deduped) > MAX_OUTLINE_ENTRIES:
+        deduped = deduped[:MAX_OUTLINE_ENTRIES]
+        deduped.append({"truncated": True})
+
+    # Strip internal _pos field
+    for entry in deduped:
+        entry.pop("_pos", None)
+
+    return deduped
 
 
 def extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
@@ -220,7 +286,7 @@ def extract_outline_for_file(file_path: Path) -> tuple[list[dict], list[str]]:
     preview: list[str] = []
     remaining_chars = _OUTLINE_PREVIEW_MAX_CHARS
     try:
-        with md_path.open(encoding="utf-8-sig") as f:
+        with md_path.open(encoding="utf-8-sig", newline="\n") as f:
             for line in f:
                 stripped = line.strip()
                 if stripped:
